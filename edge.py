@@ -1,195 +1,241 @@
-SVC="12345678-1234-5678-1234-56789abcdef0"
-CHR="12345678-1234-5678-1234-56789abcdef1"
-NAME="Nano33-FallServer"
+device_name = "Nano33-Steven"
+characteristic_uuid = "12345678-1234-5678-1234-56789abcdef1"
 
-MONGO_URL="mongodb+srv://steven:2121@iab330steven.t74aifz.mongodb.net/?retryWrites=true&w=majority&appName=IAB330Steven"
-MONGO_DB="HARData"
-MONGO_COLL="Data"
-CSV_PATH="./data.csv"
-MODEL_PATH="./har.joblib"
+mongo_url = "mongodb+srv://steven:2121@iab330steven.t74aifz.mongodb.net/?retryWrites=true&w=majority&appName=IAB330Steven"
+mongo_database_name = "HARData"
+mongo_collection_name = "Data"
 
-import os, sys, time, math, struct, asyncio, csv
+csv_file_path = "./data.csv"
+model_file_path = "./har.joblib"
+
+sample_rate_hz = 50
+window_size_samples = sample_rate_hz
+accel_impact_mg = 2800
+
+import os, sys, math, struct, asyncio, csv
 from collections import deque
 import numpy as np, pandas as pd
 from bleak import BleakClient, BleakScanner
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
 from joblib import dump, load
 from pymongo import MongoClient
 import certifi
 
-SAMPLE_RATE_HZ=50
-WINDOW_SAMPLES=2*SAMPLE_RATE_HZ
-ACC_IMPACT_MG=2800
-STILLNESS_STD_MG=80
-IMPACT_WINDOW_S=1.5
-
 async def find_device():
-    devs=await BleakScanner.discover(timeout=5.0)
-    for d in devs:
-        n=(d.name or "")
-        if NAME.lower() in n.lower():
-            print("Found", n or "(no name)", d.address)
-            return d.address
+    devices = await BleakScanner.discover(timeout=10.0)
+    for device in devices:
+        name = (device.name or "")
+        if device_name.lower() in name.lower():
+            print(name)
+            return device.address
 
-def basic_stats(v):
-    return [float(np.mean(v)), float(np.std(v)), float(np.min(v)), float(np.max(v)), float(np.max(v)-np.min(v))]
+async def collect_mode(label, csv_path=csv_file_path):
+    is_new_file = not os.path.exists(csv_path)
+    file_handle = open(csv_path, "a", newline="")
+    csv_writer = csv.writer(file_handle)
+    if is_new_file:
+        csv_writer.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
+    device_address = await find_device()
+    client = BleakClient(device_address, timeout=10)
+    await client.connect()
+    print("connected")
+    async def on_notify(_, payload):
+        timestamp, ax, ay, az, gx, gy, gz = struct.unpack("<I6h", payload)
+        csv_writer.writerow([timestamp, ax, ay, az, gx, gy, gz, label])
+        file_handle.flush()
+    await client.start_notify(characteristic_uuid, on_notify)
+    print("collecting...")
+    while True:
+        await asyncio.sleep(1)
 
-def feature_vector(arr6xN):
-    ax,ay,az,gx,gy,gz=[arr6xN[:,i] for i in range(6)]
-    feats=[]
-    for v in (ax,ay,az,gx,gy,gz): feats+=basic_stats(v)
-    amag=np.sqrt(ax*ax+ay*ay+az*az)
-    feats+=[float(np.mean(amag)), float(np.std(amag)), float(np.mean(np.abs(ax)+np.abs(ay)+np.abs(az)))]
-    return np.array(feats,dtype=float)
+def train_mode(csv_path=csv_file_path, model_path=model_file_path):
+    print("training...")
+    data_frame = pd.read_csv(csv_path)
+    samples = data_frame[["ax","ay","az","gx","gy","gz","label"]].values.tolist()
 
-async def collect_mode(label, csv_path=CSV_PATH):
-    newfile=not os.path.exists(csv_path)
-    f=open(csv_path,"a",newline=""); w=csv.writer(f)
-    if newfile: w.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
-    addr=await find_device()
-    c=BleakClient(addr, timeout=15)
-    await c.connect()
-    print("Connected", c.is_connected)
-    print(f"Collecting '{label}' → {csv_path}")
-    async def on_notify(_, data):
-        ts,ax,ay,az,gx,gy,gz=struct.unpack("<I6h", data)
-        w.writerow([ts,ax,ay,az,gx,gy,gz,label])
-    await c.start_notify(CHR, on_notify)
-    while True: await asyncio.sleep(1)
+    feature_vectors = []
+    window_labels = []
 
-def train_mode(csv_path=CSV_PATH, model_path=MODEL_PATH):
-    df=pd.read_csv(csv_path)
-    X=[]; y=[]
-    data=df[["ax","ay","az","gx","gy","gz","label"]].to_numpy()
-    N=len(data)
-    for s in range(0, N-WINDOW_SAMPLES+1, WINDOW_SAMPLES):
-        seg=data[s:s+WINDOW_SAMPLES]
-        labels=seg[:,-1]
-        vals,cnts=np.unique(labels,return_counts=True)
-        lbl=str(vals[int(np.argmax(cnts))])
-        arr=seg[:,:6].astype(float)
-        X.append(feature_vector(arr)); y.append(lbl)
-    X=np.vstack(X); y=np.array(y)
-    Xtr,Xte,Ytr,Yte=train_test_split(X,y,test_size=0.25,random_state=42,stratify=y)
-    clf=DecisionTreeClassifier(max_depth=12,class_weight="balanced",random_state=42)
-    clf.fit(Xtr,Ytr)
-    yp=clf.predict(Xte)
-    print("ACC:", accuracy_score(Yte,yp))
-    print(classification_report(Yte,yp,zero_division=0))
-    dump(clf, model_path); print("Saved", model_path)
+    total_samples = len(samples)
+    window_step = window_size_samples
 
-async def infer_mode(model_path=MODEL_PATH):
-    clf=load(model_path)
-    print("Model:", model_path, "| classes:", list(clf.classes_))
-    addr=await find_device()
-    c=BleakClient(addr, timeout=15)
-    await c.connect()
-    print("Connected", c.is_connected)
-    win=deque(maxlen=WINDOW_SAMPLES)
-    fallw=deque(maxlen=int(1.0*SAMPLE_RATE_HZ))
-    last_imp=0.0
-    since=0
-    async def on_notify(_, data):
-        nonlocal last_imp, since
-        ts,ax,ay,az,gx,gy,gz=struct.unpack("<I6h", data)
-        win.append([ax,ay,az,gx,gy,gz]); fallw.append([ax,ay,az]); since+=1
-        m=math.sqrt(ax*ax+ay*ay+az*az); now=time.time()
-        if m>ACC_IMPACT_MG: last_imp=now
-        if last_imp and (now-last_imp)<IMPACT_WINDOW_S and len(fallw)>int(0.8*SAMPLE_RATE_HZ):
-            mags=[math.sqrt(a*a+b*b+c*c) for (a,b,c) in list(fallw)[-int(0.8*SAMPLE_RATE_HZ):]]
-            if float(np.std(mags))<STILLNESS_STD_MG:
-                print(time.strftime("%H:%M:%S"), "| FALL"); last_imp=0.0
-        if since>=WINDOW_SAMPLES and len(win)==WINDOW_SAMPLES:
-            since=0
-            arr=np.array(list(win),dtype=float)
-            feats=feature_vector(arr)
-            lab=str(clf.predict([feats])[0])
-            print(time.strftime("%H:%M:%S"), "|", lab)
-    await c.start_notify(CHR, on_notify)
-    while True: await asyncio.sleep(1)
+    for window_start_index in range(0, total_samples - window_step + 1, window_step):
+        window_samples_list = samples[window_start_index:window_start_index + window_step]
 
-def mongo_db():
+        window_label_list = [row[6] for row in window_samples_list]
+        majority_label = max(set(window_label_list), key=window_label_list.count)
+
+        ax_series = [row[0] for row in window_samples_list]
+        ay_series = [row[1] for row in window_samples_list]
+        az_series = [row[2] for row in window_samples_list]
+        gx_series = [row[3] for row in window_samples_list]
+        gy_series = [row[4] for row in window_samples_list]
+        gz_series = [row[5] for row in window_samples_list]
+
+        feature_values = []
+
+        for series in (ax_series, ay_series, az_series, gx_series, gy_series, gz_series):
+            series_length = len(series)
+            mean_value = sum(series) / series_length
+            variance_value = sum((x - mean_value) * (x - mean_value) for x in series) / series_length
+            std_value = math.sqrt(variance_value)
+            min_value = min(series)
+            max_value = max(series)
+            range_value = max_value - min_value
+            feature_values += [mean_value, std_value, min_value, max_value, range_value]
+
+        magnitude_series = [math.sqrt(x*x + y*y + z*z) for x, y, z in zip(ax_series, ay_series, az_series)]
+        magnitude_length = len(magnitude_series)
+        mean_magnitude = sum(magnitude_series) / magnitude_length
+        variance_magnitude = sum((m - mean_magnitude) * (m - mean_magnitude) for m in magnitude_series) / magnitude_length
+        std_magnitude = math.sqrt(variance_magnitude)
+        signal_magnitude_area = sum(abs(x) + abs(y) + abs(z) for x, y, z in zip(ax_series, ay_series, az_series)) / len(ax_series)
+
+        feature_values += [mean_magnitude, std_magnitude, signal_magnitude_area]
+
+        feature_vectors.append(feature_values)
+        window_labels.append(majority_label)
+
+    model = DecisionTreeClassifier(max_depth=12, class_weight="balanced", random_state=42)
+    model.fit(np.array(feature_vectors), np.array(window_labels))
+    dump(model, model_path)
+    print("training done")
+
+async def infer_mode(model_path=model_file_path):
+    model = load(model_path)
+    print("model ready")
+    device_address = await find_device()
+    client = BleakClient(device_address, timeout=10)
+    await client.connect()
+    print("connected")
+    print("inferring...")
+
+    window_buffer = deque(maxlen=window_size_samples)
+    samples_count_in_window = 0
+
+    async def on_notify(_, payload):
+        nonlocal samples_count_in_window
+        _, ax, ay, az, gx, gy, gz = struct.unpack("<I6h", payload)
+
+        window_buffer.append([ax, ay, az, gx, gy, gz])
+        samples_count_in_window += 1
+
+        current_magnitude = math.sqrt(ax*ax + ay*ay + az*az)
+        if current_magnitude > accel_impact_mg:
+            print("FALL")
+
+        if samples_count_in_window >= window_size_samples and len(window_buffer) >= window_size_samples:
+            samples_count_in_window = 0
+            rows_in_window = list(window_buffer)
+
+            ax_series = [row[0] for row in rows_in_window]
+            ay_series = [row[1] for row in rows_in_window]
+            az_series = [row[2] for row in rows_in_window]
+            gx_series = [row[3] for row in rows_in_window]
+            gy_series = [row[4] for row in rows_in_window]
+            gz_series = [row[5] for row in rows_in_window]
+
+            feature_values = []
+
+            for series in (ax_series, ay_series, az_series, gx_series, gy_series, gz_series):
+                series_length = len(series)
+                mean_value = sum(series) / series_length
+                variance_value = sum((x - mean_value) * (x - mean_value) for x in series) / series_length
+                std_value = math.sqrt(variance_value)
+                min_value = min(series)
+                max_value = max(series)
+                range_value = max_value - min_value
+                feature_values += [mean_value, std_value, min_value, max_value, range_value]
+
+            magnitude_series = [math.sqrt(x*x + y*y + z*z) for x, y, z in zip(ax_series, ay_series, az_series)]
+            magnitude_length = len(magnitude_series)
+            mean_magnitude = sum(magnitude_series) / magnitude_length
+            variance_magnitude = sum((m - mean_magnitude) * (m - mean_magnitude) for m in magnitude_series) / magnitude_length
+            std_magnitude = math.sqrt(variance_magnitude)
+            signal_magnitude_area = sum(abs(x) + abs(y) + abs(z) for x, y, z in zip(ax_series, ay_series, az_series)) / len(ax_series)
+
+            feature_values += [mean_magnitude, std_magnitude, signal_magnitude_area]
+
+            prediction_label = model.predict([feature_values])[0]
+            print(str(prediction_label))
+
+    await client.start_notify(characteristic_uuid, on_notify)
+    while True:
+        await asyncio.sleep(1)
+
+def get_database():
     return MongoClient(
-        MONGO_URL,
+        mongo_url,
         tls=True,
         tlsCAFile=certifi.where(),
-        serverSelectionTimeoutMS=30000,
-        connectTimeoutMS=30000,
-        socketTimeoutMS=30000,
-    )[MONGO_DB]
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000,
+        socketTimeoutMS=10000,
+    )[mongo_database_name]
 
-def cloud_upload(csv_path=CSV_PATH):
-    db=mongo_db(); coll=db[MONGO_COLL]
-    df=pd.read_csv(csv_path, usecols=["ts","ax","ay","az","gx","gy","gz","label"])
-    df["ts"]=df["ts"].astype(int)
-    for col in ["ax","ay","az","gx","gy","gz"]: df[col]=df[col].astype(int)
-    df["label"]=df["label"].astype(str)
-    rec=df.to_dict("records")
-    step=1000
-    for i in range(0,len(rec),step): coll.insert_many(rec[i:i+step])
-    print("Uploaded", len(rec), "rows to", f"{MONGO_DB}.{MONGO_COLL}")
+def cloud_upload(csv_path=csv_file_path):
+    print("uploading...")
+    collection = get_database()[mongo_collection_name]
+    data_frame = pd.read_csv(csv_path, usecols=["ts","ax","ay","az","gx","gy","gz","label"])
+    data_frame["ts"] = data_frame["ts"].astype(int)
+    for column_name in ["ax","ay","az","gx","gy","gz"]:
+        data_frame[column_name] = data_frame[column_name].astype(int)
+    data_frame["label"] = data_frame["label"].astype(str)
+    collection.insert_many(data_frame.to_dict("records"))
+    print("upload done")
 
-def cloud_update(csv_path=CSV_PATH):
-    db=mongo_db(); coll=db[MONGO_COLL]
-    r=coll.delete_many({})
-    print("Cleared cloud rows:", r.deleted_count)
+def cloud_update(csv_path=csv_file_path):
+    print("updating...")
+    collection = get_database()[mongo_collection_name]
+    collection.delete_many({})
     cloud_upload(csv_path)
+    print("update done")
 
-def cloud_retrieve(csv_path=CSV_PATH):
-    db=mongo_db(); coll=db[MONGO_COLL]
-    cur=coll.find({}, {"_id":0,"ts":1,"ax":1,"ay":1,"az":1,"gx":1,"gy":1,"gz":1,"label":1}).sort("ts",1)
-    rows=list(cur)
-    with open(csv_path,"w",newline="") as f:
-        w=csv.writer(f)
-        w.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
-        for d in rows:
-            w.writerow([int(d.get("ts",0)),int(d.get("ax",0)),int(d.get("ay",0)),int(d.get("az",0)),
-                        int(d.get("gx",0)),int(d.get("gy",0)),int(d.get("gz",0)),str(d.get("label",""))])
-    print("Downloaded", len(rows), "rows to", csv_path)
+def cloud_retrieve(csv_path=csv_file_path):
+    print("downloading...")
+    collection = get_database()[mongo_collection_name]
+    documents = list(collection.find({}, {"_id":0,"ts":1,"ax":1,"ay":1,"az":1,"gx":1,"gy":1,"gz":1,"label":1}).sort("ts",1))
+    with open(csv_path, "w", newline="") as file_handle:
+        csv_writer = csv.writer(file_handle)
+        csv_writer.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
+        for document in documents:
+            csv_writer.writerow([
+                int(document.get("ts",0)),
+                int(document.get("ax",0)),
+                int(document.get("ay",0)),
+                int(document.get("az",0)),
+                int(document.get("gx",0)),
+                int(document.get("gy",0)),
+                int(document.get("gz",0)),
+                str(document.get("label","")),
+            ])
+    print("download done")
 
 def cloud_delete():
-    db=mongo_db(); coll=db[MONGO_COLL]
-    r=coll.delete_many({})
-    print("Deleted", r.deleted_count, "rows from", f"{MONGO_DB}.{MONGO_COLL}")
+    collection = get_database()[mongo_collection_name]
+    collection.delete_many({})
+    print("delete done")
 
 def menu():
-    global MONGO_URL, MONGO_DB, MONGO_COLL, CSV_PATH, MODEL_PATH
     while True:
-        print("\n1) collect  2) train  3) infer  4) upload  5) retrieve  6) update  7) delete  9) config  0) quit")
-        s=input("> ").strip()
-        if s=="1":
-            lbl=input("label [walking/lying/fall/...]: ").strip()
-            p=input(f"csv path [{CSV_PATH}]: ").strip() or CSV_PATH
-            asyncio.run(collect_mode(lbl,p))
-        elif s=="2":
-            p=input(f"csv path [{CSV_PATH}]: ").strip() or CSV_PATH
-            m=input(f"model path [{MODEL_PATH}]: ").strip() or MODEL_PATH
-            train_mode(p,m)
-        elif s=="3":
-            m=input(f"model path [{MODEL_PATH}]: ").strip() or MODEL_PATH
-            asyncio.run(infer_mode(m))
-        elif s=="4":
-            p=input(f"csv path [{CSV_PATH}]: ").strip() or CSV_PATH
-            cloud_upload(p)
-        elif s=="5":
-            p=input(f"csv path to overwrite [{CSV_PATH}]: ").strip() or CSV_PATH
-            cloud_retrieve(p)
-        elif s=="6":
-            p=input(f"csv path [{CSV_PATH}]: ").strip() or CSV_PATH
-            cloud_update(p)
-        elif s=="7":
+        print("\n1) collect  2) train  3) infer  4) upload  5) retrieve  6) update  7) delete  0) quit")
+        choice = input("> ").strip()
+        if choice == "1":
+            asyncio.run(collect_mode(input("label: ").strip()))
+        elif choice == "2":
+            train_mode()
+        elif choice == "3":
+            asyncio.run(infer_mode())
+        elif choice == "4":
+            cloud_upload()
+        elif choice == "5":
+            cloud_retrieve()
+        elif choice == "6":
+            cloud_update()
+        elif choice == "7":
             cloud_delete()
-        elif s=="9":
-            print("Current:", {"url":MONGO_URL,"db":MONGO_DB,"coll":MONGO_COLL,"csv":CSV_PATH,"model":MODEL_PATH})
-            MONGO_URL=input("Mongo URL (SRV): ").strip() or MONGO_URL
-            MONGO_DB=input(f"DB name [{MONGO_DB}]: ").strip() or MONGO_DB
-            MONGO_COLL=input(f"Collection [{MONGO_COLL}]: ").strip() or MONGO_COLL
-            CSV_PATH=input(f"Local CSV [{CSV_PATH}]: ").strip() or CSV_PATH
-            MODEL_PATH=input(f"Model path [{MODEL_PATH}]: ").strip() or MODEL_PATH
-        elif s=="0":
+        elif choice == "0":
             sys.exit(0)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     menu()

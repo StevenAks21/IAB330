@@ -44,8 +44,8 @@ void setup() {
     while (1) { delay(1000); }
   }
 
-  BLE.setLocalName("Nano33-FallServer");
-  BLE.setDeviceName("Nano33-FallServer");
+  BLE.setLocalName("Nano33-Steven");
+  BLE.setDeviceName("Nano33-Steven");
   BLE.setAdvertisedService(imuService);
   imuService.addCharacteristic(imuChar);
   BLE.addService(imuService);
