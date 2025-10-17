@@ -1,4 +1,4 @@
-device_name = "Nano33-FallServer"
+device_name = "Nano33-Steven"
 characteristic_uuid = "12345678-1234-5678-1234-56789abcdef1"
 
 mongo_url = "mongodb+srv://steven:2121@iab330steven.t74aifz.mongodb.net/?retryWrites=true&w=majority&appName=IAB330Steven"
@@ -19,6 +19,7 @@ from bleak import BleakClient, BleakScanner
 from sklearn.tree import DecisionTreeClassifier
 from joblib import dump, load
 from pymongo import MongoClient
+import certifi
 
 async def find_device():
     devices = await BleakScanner.discover(timeout=10.0)
@@ -29,18 +30,18 @@ async def find_device():
             return device.address
 
 async def collect_mode(label, csv_path=csv_file_path):
-    new_file = not os.path.exists(csv_path)
+    is_new_file = not os.path.exists(csv_path)
     file_handle = open(csv_path, "a", newline="")
-    writer = csv.writer(file_handle)
-    if new_file:
-        writer.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
+    csv_writer = csv.writer(file_handle)
+    if is_new_file:
+        csv_writer.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
     device_address = await find_device()
     client = BleakClient(device_address, timeout=10)
     await client.connect()
     print("connected")
     async def on_notify(_, payload):
-        timestamp,ax,ay,az,gx,gy,gz = struct.unpack("<I6h", payload)
-        writer.writerow([timestamp,ax,ay,az,gx,gy,gz,label])
+        timestamp, ax, ay, az, gx, gy, gz = struct.unpack("<I6h", payload)
+        csv_writer.writerow([timestamp, ax, ay, az, gx, gy, gz, label])
         file_handle.flush()
     await client.start_notify(characteristic_uuid, on_notify)
     print("collecting...")
@@ -50,32 +51,53 @@ async def collect_mode(label, csv_path=csv_file_path):
 def train_mode(csv_path=csv_file_path, model_path=model_file_path):
     print("training...")
     data_frame = pd.read_csv(csv_path)
-    rows_list = data_frame[["ax","ay","az","gx","gy","gz","label"]].to_numpy().tolist()
-    features, labels = [], []
-    total_rows = len(rows_list)
-    for start in range(0, total_rows - window_size_samples + 1, window_size_samples):
-        segment = rows_list[start:start + window_size_samples]
-        segment_labels = [row[6] for row in segment]
-        label_majority = max(set(segment_labels), key=segment_labels.count)
-        ax = [row[0] for row in segment]; ay = [row[1] for row in segment]; az = [row[2] for row in segment]
-        gx = [row[3] for row in segment]; gy = [row[4] for row in segment]; gz = [row[5] for row in segment]
+    samples = data_frame[["ax","ay","az","gx","gy","gz","label"]].values.tolist()
+
+    feature_vectors = []
+    window_labels = []
+
+    total_samples = len(samples)
+    window_step = window_size_samples
+
+    for window_start_index in range(0, total_samples - window_step + 1, window_step):
+        window_samples_list = samples[window_start_index:window_start_index + window_step]
+
+        window_label_list = [row[6] for row in window_samples_list]
+        majority_label = max(set(window_label_list), key=window_label_list.count)
+
+        ax_series = [row[0] for row in window_samples_list]
+        ay_series = [row[1] for row in window_samples_list]
+        az_series = [row[2] for row in window_samples_list]
+        gx_series = [row[3] for row in window_samples_list]
+        gy_series = [row[4] for row in window_samples_list]
+        gz_series = [row[5] for row in window_samples_list]
+
         feature_values = []
-        for series in (ax, ay, az, gx, gy, gz):
-            mean_value = sum(series) / len(series)
-            std_value = (sum((x - mean_value) * (x - mean_value) for x in series) / len(series)) ** 0.5
+
+        for series in (ax_series, ay_series, az_series, gx_series, gy_series, gz_series):
+            series_length = len(series)
+            mean_value = sum(series) / series_length
+            variance_value = sum((x - mean_value) * (x - mean_value) for x in series) / series_length
+            std_value = math.sqrt(variance_value)
             min_value = min(series)
             max_value = max(series)
             range_value = max_value - min_value
             feature_values += [mean_value, std_value, min_value, max_value, range_value]
-        magnitude_series = [math.sqrt(ax[i]*ax[i] + ay[i]*ay[i] + az[i]*az[i]) for i in range(len(ax))]
-        mean_magnitude = sum(magnitude_series) / len(magnitude_series)
-        std_magnitude = (sum((x - mean_magnitude) * (x - mean_magnitude) for x in magnitude_series) / len(magnitude_series)) ** 0.5
-        signal_magnitude_area = sum(abs(ax[i]) + abs(ay[i]) + abs(az[i]) for i in range(len(ax))) / len(ax)
+
+        magnitude_series = [math.sqrt(x*x + y*y + z*z) for x, y, z in zip(ax_series, ay_series, az_series)]
+        magnitude_length = len(magnitude_series)
+        mean_magnitude = sum(magnitude_series) / magnitude_length
+        variance_magnitude = sum((m - mean_magnitude) * (m - mean_magnitude) for m in magnitude_series) / magnitude_length
+        std_magnitude = math.sqrt(variance_magnitude)
+        signal_magnitude_area = sum(abs(x) + abs(y) + abs(z) for x, y, z in zip(ax_series, ay_series, az_series)) / len(ax_series)
+
         feature_values += [mean_magnitude, std_magnitude, signal_magnitude_area]
-        features.append(feature_values)
-        labels.append(label_majority)
+
+        feature_vectors.append(feature_values)
+        window_labels.append(majority_label)
+
     model = DecisionTreeClassifier(max_depth=12, class_weight="balanced", random_state=42)
-    model.fit(np.array(features), np.array(labels))
+    model.fit(np.array(feature_vectors), np.array(window_labels))
     dump(model, model_path)
     print("training done")
 
@@ -87,35 +109,56 @@ async def infer_mode(model_path=model_file_path):
     await client.connect()
     print("connected")
     print("inferring...")
+
     window_buffer = deque(maxlen=window_size_samples)
-    samples_in_window = 0
+    samples_count_in_window = 0
+
     async def on_notify(_, payload):
-        nonlocal samples_in_window
-        _,ax,ay,az,gx,gy,gz = struct.unpack("<I6h", payload)
-        window_buffer.append([ax,ay,az,gx,gy,gz])
-        samples_in_window += 1
-        magnitude = math.sqrt(ax*ax + ay*ay + az*az)
-        if magnitude > accel_impact_mg:
+        nonlocal samples_count_in_window
+        _, ax, ay, az, gx, gy, gz = struct.unpack("<I6h", payload)
+
+        window_buffer.append([ax, ay, az, gx, gy, gz])
+        samples_count_in_window += 1
+
+        current_magnitude = math.sqrt(ax*ax + ay*ay + az*az)
+        if current_magnitude > accel_impact_mg:
             print("FALL")
-        if samples_in_window >= window_size_samples and len(window_buffer) >= window_size_samples:
-            samples_in_window = 0
-            array_window = list(window_buffer)
-            ax = [row[0] for row in array_window]; ay = [row[1] for row in array_window]; az = [row[2] for row in array_window]
-            gx = [row[3] for row in array_window]; gy = [row[4] for row in array_window]; gz = [row[5] for row in array_window]
+
+        if samples_count_in_window >= window_size_samples and len(window_buffer) >= window_size_samples:
+            samples_count_in_window = 0
+            rows_in_window = list(window_buffer)
+
+            ax_series = [row[0] for row in rows_in_window]
+            ay_series = [row[1] for row in rows_in_window]
+            az_series = [row[2] for row in rows_in_window]
+            gx_series = [row[3] for row in rows_in_window]
+            gy_series = [row[4] for row in rows_in_window]
+            gz_series = [row[5] for row in rows_in_window]
+
             feature_values = []
-            for series in (ax, ay, az, gx, gy, gz):
-                mean_value = sum(series) / len(series)
-                std_value = (sum((x - mean_value) * (x - mean_value) for x in series) / len(series)) ** 0.5
+
+            for series in (ax_series, ay_series, az_series, gx_series, gy_series, gz_series):
+                series_length = len(series)
+                mean_value = sum(series) / series_length
+                variance_value = sum((x - mean_value) * (x - mean_value) for x in series) / series_length
+                std_value = math.sqrt(variance_value)
                 min_value = min(series)
                 max_value = max(series)
                 range_value = max_value - min_value
                 feature_values += [mean_value, std_value, min_value, max_value, range_value]
-            magnitude_series = [math.sqrt(ax[i]*ax[i] + ay[i]*ay[i] + az[i]*az[i]) for i in range(len(ax))]
-            mean_magnitude = sum(magnitude_series) / len(magnitude_series)
-            std_magnitude = (sum((x - mean_magnitude) * (x - mean_magnitude) for x in magnitude_series) / len(magnitude_series)) ** 0.5
-            signal_magnitude_area = sum(abs(ax[i]) + abs(ay[i]) + abs(az[i]) for i in range(len(ax))) / len(ax)
+
+            magnitude_series = [math.sqrt(x*x + y*y + z*z) for x, y, z in zip(ax_series, ay_series, az_series)]
+            magnitude_length = len(magnitude_series)
+            mean_magnitude = sum(magnitude_series) / magnitude_length
+            variance_magnitude = sum((m - mean_magnitude) * (m - mean_magnitude) for m in magnitude_series) / magnitude_length
+            std_magnitude = math.sqrt(variance_magnitude)
+            signal_magnitude_area = sum(abs(x) + abs(y) + abs(z) for x, y, z in zip(ax_series, ay_series, az_series)) / len(ax_series)
+
             feature_values += [mean_magnitude, std_magnitude, signal_magnitude_area]
-            print(str(model.predict([feature_values])[0]))
+
+            prediction_label = model.predict([feature_values])[0]
+            print(str(prediction_label))
+
     await client.start_notify(characteristic_uuid, on_notify)
     while True:
         await asyncio.sleep(1)
@@ -124,7 +167,7 @@ def get_database():
     return MongoClient(
         mongo_url,
         tls=True,
-        tlsCAFile="/etc/ssl/certs/ca-certificates.crt",
+        tlsCAFile=certifi.where(),
         serverSelectionTimeoutMS=10000,
         connectTimeoutMS=10000,
         socketTimeoutMS=10000,
@@ -135,8 +178,8 @@ def cloud_upload(csv_path=csv_file_path):
     collection = get_database()[mongo_collection_name]
     data_frame = pd.read_csv(csv_path, usecols=["ts","ax","ay","az","gx","gy","gz","label"])
     data_frame["ts"] = data_frame["ts"].astype(int)
-    for column in ["ax","ay","az","gx","gy","gz"]:
-        data_frame[column] = data_frame[column].astype(int)
+    for column_name in ["ax","ay","az","gx","gy","gz"]:
+        data_frame[column_name] = data_frame[column_name].astype(int)
     data_frame["label"] = data_frame["label"].astype(str)
     collection.insert_many(data_frame.to_dict("records"))
     print("upload done")
@@ -153,10 +196,10 @@ def cloud_retrieve(csv_path=csv_file_path):
     collection = get_database()[mongo_collection_name]
     documents = list(collection.find({}, {"_id":0,"ts":1,"ax":1,"ay":1,"az":1,"gx":1,"gy":1,"gz":1,"label":1}).sort("ts",1))
     with open(csv_path, "w", newline="") as file_handle:
-        writer = csv.writer(file_handle)
-        writer.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
+        csv_writer = csv.writer(file_handle)
+        csv_writer.writerow(["ts","ax","ay","az","gx","gy","gz","label"])
         for document in documents:
-            writer.writerow([
+            csv_writer.writerow([
                 int(document.get("ts",0)),
                 int(document.get("ax",0)),
                 int(document.get("ay",0)),
